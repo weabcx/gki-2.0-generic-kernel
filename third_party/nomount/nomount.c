@@ -640,6 +640,214 @@ static int nm_getattr(IDMAP_ARG const struct path *path, struct kstat *stat, u32
     return res;
 }
 
+/*
+ * VFS hook entry points used by third_party/nomount/nomount-6.6.patch.
+ *
+ * These wrappers must remain in the source asset because
+ * scripts/ci-integrate.sh copies this file to:
+ *
+ *     $COMMON/fs/nomount.c
+ *
+ * CONFIG_NOMOUNT=y then links this file into vmlinux.
+ */
+
+/*
+ * getname is intentionally a pass-through.
+ *
+ * NoMount performs the actual redirection at dentry/inode lookup time.
+ * Replacing struct filename here would break filename lifetime management
+ * and would also bypass the virtual topology created by NoMount.
+ */
+struct filename *nomount_handle_getname(struct filename *name)
+{
+	return name;
+}
+
+/*
+ * The hook in namei.c treats:
+ *
+ *   < 0  = return this error
+ *   > 0  = permission already handled
+ *   == 0 = continue with normal VFS permission checks
+ */
+int nomount_handle_permission(struct inode *inode, int mask)
+{
+	struct nm_iop *nm_iop;
+	struct nm_fop *nm_fop;
+
+	if (unlikely(!inode))
+		return 0;
+
+	/*
+	 * Virtual NoMount inodes are created by nomount_init_prealloc_inode()
+	 * and use these private operation tables. Their access is controlled by
+	 * the backing object / dentry_open path, so do not reject them here.
+	 */
+	if (inode->i_op == &nm_file_iops || inode->i_op == &nm_dir_iops)
+		return 1;
+
+	/*
+	 * Existing real inodes may have their operation tables wrapped so that
+	 * NoMount can intercept lookup/readdir. Do not alter normal permission
+	 * handling for those inodes.
+	 */
+	nm_iop = nm_get_nm_iop(smp_load_acquire(&inode->i_op));
+	nm_fop = nm_get_nm_fop(smp_load_acquire(&inode->i_fop));
+
+	if (nm_iop || nm_fop)
+		return 0;
+
+	return 0;
+}
+
+/*
+ * readdir hook.
+ *
+ * The NoMount patch replaces the normal iterate_shared call with this
+ * wrapper. For a NoMount-wrapped directory, use the proxy implementation.
+ * For an ordinary directory, call the original filesystem operation.
+ */
+int nomount_handle_iterate_dir(struct file *file, struct dir_context *ctx)
+{
+	const struct file_operations *fop;
+	struct nm_fop *nm_fop;
+
+	if (unlikely(!file || !ctx))
+		return -EINVAL;
+
+	fop = READ_ONCE(file->f_op);
+	nm_fop = nm_get_nm_fop(fop);
+
+	if (nm_fop)
+		return nomount_hijacked_iterate_dir(file, ctx);
+
+	if (fop && fop->iterate_shared)
+		return fop->iterate_shared(file, ctx);
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+	if (fop && fop->iterate)
+		return fop->iterate(file, ctx);
+#endif
+
+	return -ENOTDIR;
+}
+
+/*
+ * vfs_getattr() calls vfs_getattr_nosec() first and passes its result here.
+ *
+ * For virtual NoMount inodes, nm_getattr() has already supplied the backing
+ * attributes. Normalize the reported inode number and device number to the
+ * virtual inode. For ordinary paths, preserve the original result.
+ */
+int nomount_handle_getattr(int ret, const struct path *path,
+			   struct kstat *stat)
+{
+	struct inode *inode;
+	struct nm_inode_info *info;
+
+	if (ret || !path || !path->dentry || !stat)
+		return ret;
+
+	inode = d_backing_inode(path->dentry);
+	if (!inode)
+		return ret;
+
+	if (inode->i_op != &nm_file_iops && inode->i_op != &nm_dir_iops)
+		return ret;
+
+	info = inode->i_private;
+	if (!info)
+		return -EIO;
+
+	stat->ino = inode->i_ino;
+	stat->dev = inode->i_sb->s_dev;
+
+	return 0;
+}
+
+/*
+ * Return the backing path for a virtual NoMount inode when one exists.
+ *
+ * Returning NULL means that d_path() should use the original path.
+ * Calling d_path() on the backing path is safe for normal backing files;
+ * if the backing path is itself a NoMount path, leave resolution to the
+ * normal d_path implementation rather than recurse indefinitely.
+ */
+char *nomount_handle_dpath(const struct path *path, char *buf, int buflen)
+{
+	struct inode *inode;
+	struct nm_inode_info *info;
+
+	if (!path || !path->dentry || !buf || buflen <= 0)
+		return NULL;
+
+	inode = d_backing_inode(path->dentry);
+	if (!inode)
+		return NULL;
+
+	if (inode->i_op != &nm_file_iops && inode->i_op != &nm_dir_iops)
+		return NULL;
+
+	info = inode->i_private;
+	if (!info || !info->r_path.dentry)
+		return NULL;
+
+	return d_path(&info->r_path, buf, buflen);
+}
+
+/*
+ * Replace proc/<pid>/maps metadata for a virtual file with the metadata of
+ * the backing inode.
+ */
+bool nomount_spoof_mmap_metadata(struct inode *inode, dev_t *dev,
+				 unsigned long *ino)
+{
+	struct nm_inode_info *info;
+	struct inode *real_inode;
+
+	if (!inode || !dev || !ino)
+		return false;
+
+	if (inode->i_op != &nm_file_iops && inode->i_op != &nm_dir_iops)
+		return false;
+
+	info = inode->i_private;
+	if (!info || !info->r_path.dentry)
+		return false;
+
+	real_inode = d_backing_inode(info->r_path.dentry);
+	if (!real_inode)
+		return false;
+
+	*dev = real_inode->i_sb->s_dev;
+	*ino = real_inode->i_ino;
+
+	return true;
+}
+
+void nomount_spoof_statfs(const struct path *path, struct kstatfs *buf)
+{
+	struct inode *inode;
+	struct nm_inode_info *info;
+
+	if (!path || !path->dentry || !buf)
+		return;
+
+	inode = d_backing_inode(path->dentry);
+	if (!inode)
+		return;
+
+	if (inode->i_op != &nm_file_iops && inode->i_op != &nm_dir_iops)
+		return;
+
+	info = inode->i_private;
+	if (!info || !info->r_path.dentry)
+		return;
+
+	if (vfs_statfs(&info->r_path, buf))
+		return;
+}
+
 static int nm_setattr(IDMAP_ARG struct dentry *dentry, struct iattr *attr)
 {
     struct inode *v_inode = d_inode(dentry);
